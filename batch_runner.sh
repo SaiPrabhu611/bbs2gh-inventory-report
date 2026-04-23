@@ -62,8 +62,9 @@ EXAMPLES:
     $(basename "$0") projects.csv --dry-run
 
 ENVIRONMENT VARIABLES:
-    BBS_PAT    Bitbucket Server personal access token (required)
-    
+    BBS_USER       Bitbucket Server username (required)
+    BBS_PASSWORD   Bitbucket Server password (required)
+
 EOF
     exit 0
 }
@@ -128,9 +129,11 @@ validate() {
         exit 1
     fi
 
-    if [[ -z "${BBS_PAT:-}" ]]; then
-        log_error "BBS_PAT environment variable is required"
-        log_info "Set it with: export BBS_PAT='your_token'"
+    if [[ -z "${BBS_USER:-}" ]] || [[ -z "${BBS_PASSWORD:-}" ]]; then
+        log_error "BBS_USER and BBS_PASSWORD environment variables are required"
+        log_info "Set them with:"
+        log_info "  export BBS_USER='your_username'"
+        log_info "  export BBS_PASSWORD='your_password'"
         exit 1
     fi
 
@@ -188,14 +191,14 @@ run_batches() {
         log_info "Batch $batch_num/$num_batches: Projects $current_start to $current_end"
 
         if [[ "$DRY_RUN" == "true" ]]; then
-            echo "  Command: $INVENTORY_SCRIPT -f $PROJECTS_FILE -s $current_start -e $current_end -t \$BBS_PAT"
+            echo "  Command: $INVENTORY_SCRIPT -f $PROJECTS_FILE -s $current_start -e $current_end -u \$BBS_USER:\$BBS_PASSWORD"
         else
             local verbose_flag=""
             if [[ "$VERBOSE" == "true" ]]; then
                 verbose_flag="-v"
             fi
 
-            if "$INVENTORY_SCRIPT" -f "$PROJECTS_FILE" -s "$current_start" -e "$current_end" -t "$BBS_PAT" $verbose_flag; then
+            if "$INVENTORY_SCRIPT" -f "$PROJECTS_FILE" -s "$current_start" -e "$current_end" -u "${BBS_USER}:${BBS_PASSWORD}" $verbose_flag; then
                 log_info "Batch $batch_num completed successfully"
                 ((successful_batches++))
             else
@@ -232,4 +235,3 @@ main() {
 }
 
 main "$@"
-
