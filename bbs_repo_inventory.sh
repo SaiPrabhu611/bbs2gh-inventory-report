@@ -22,6 +22,7 @@ readonly SCRIPT_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
 readonly TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 readonly DEFAULT_PAGE_LIMIT=100
 readonly DEFAULT_PARALLEL_JOBS=5
+readonly DEFAULT_PARALLEL_THRESHOLD=10   # projects with > this many repos run in parallel
 readonly DEFAULT_RETRY_COUNT=3
 readonly DEFAULT_RETRY_DELAY=5
 readonly DEFAULT_TIMEOUT=30
@@ -35,6 +36,7 @@ REPORT_DIR="${OUTPUT_DIR}/reports"
 BBS_API_VERSION="1.0"
 PAGE_LIMIT=${PAGE_LIMIT:-$DEFAULT_PAGE_LIMIT}
 PARALLEL_JOBS=${PARALLEL_JOBS:-$DEFAULT_PARALLEL_JOBS}
+PARALLEL_THRESHOLD=${PARALLEL_THRESHOLD:-$DEFAULT_PARALLEL_THRESHOLD}
 RETRY_COUNT=${RETRY_COUNT:-$DEFAULT_RETRY_COUNT}
 RETRY_DELAY=${RETRY_DELAY:-$DEFAULT_RETRY_DELAY}
 API_TIMEOUT=${API_TIMEOUT:-$DEFAULT_TIMEOUT}
@@ -43,8 +45,7 @@ API_TIMEOUT=${API_TIMEOUT:-$DEFAULT_TIMEOUT}
 PROJECTS_FILE=""
 START_INDEX=1
 END_INDEX=""
-BBS_PAT=""
-BBS_USER=""
+BBS_CREDENTIALS=""   # Expected format: "username:password"
 BBS_BASE_URL=""
 DRY_RUN=false
 VERBOSE=false
@@ -115,12 +116,10 @@ REQUIRED ARGUMENTS:
     -s, --start <num>       Start index (1-based) for batch processing
     -e, --end <num>         End index for batch processing
 
-AUTHENTICATION (one of the following):
-    -t, --token <token>     Bitbucket Server personal access token
-    -u, --user <user:pass>  Username and password (user:password format)
-    
+AUTHENTICATION (Basic auth only):
+    -u, --user <user:pass>  Username and password in "user:password" format
+
     Environment variables can also be used:
-        BBS_PAT           Personal access token
         BBS_USER            Username
         BBS_PASSWORD        Password
 
@@ -128,7 +127,11 @@ OPTIONS:
     -b, --base-url <url>    Override base URL from CSV (optional)
     -o, --output <dir>      Output directory (default: ./output)
     -l, --limit <num>       Page limit for API calls (default: 100)
-    -p, --parallel <num>    Number of parallel jobs (default: 5)
+    -p, --parallel <num>    Concurrency level when parallel mode kicks in (default: 5)
+    --parallel-threshold <n> Switch a project to parallel mode when it has more
+                            than <n> repositories (default: 10). Use 0 to force
+                            parallel always; use a very large number to force
+                            sequential always.
     -r, --retry <num>       Number of retries for failed API calls (default: 3)
     --resume <file>         Resume from a previous progress file
     --dry-run               Validate inputs without making API calls
@@ -136,17 +139,19 @@ OPTIONS:
     -h, --help              Show this help message
 
 EXAMPLES:
-    # Process projects 1-20 with token authentication
-    ${SCRIPT_NAME} -f projects.csv -s 1 -e 20 -t "your_token"
+    # Process projects 1-20 with basic auth
+    ${SCRIPT_NAME} -f projects.csv -s 1 -e 20 -u "s5642784:mypass"
 
-    # Process projects 21-50 with verbose output
-    ${SCRIPT_NAME} -f projects.csv -s 21 -e 50 -t "your_token" -v
+    # Using environment variables for credentials
+    export BBS_USER="s5642784"
+    export BBS_PASSWORD="mypass"
+    ${SCRIPT_NAME} -f projects.csv -s 21 -e 50 -v
 
     # Resume from previous run
-    ${SCRIPT_NAME} -f projects.csv -s 1 -e 100 -t "your_token" --resume progress.json
+    ${SCRIPT_NAME} -f projects.csv -s 1 -e 100 -u "user:pass" --resume progress.json
 
     # Dry run to validate setup
-    ${SCRIPT_NAME} -f projects.csv -s 1 -e 5 -t "your_token" --dry-run
+    ${SCRIPT_NAME} -f projects.csv -s 1 -e 5 -u "user:pass" --dry-run
 
 CSV FORMAT:
     The input CSV should have the following columns (tab or comma separated):
@@ -181,12 +186,8 @@ parse_arguments() {
                 END_INDEX="$2"
                 shift 2
                 ;;
-            -t|--token)
-                BBS_PAT="$2"
-                shift 2
-                ;;
             -u|--user)
-                BBS_USER="$2"
+                BBS_CREDENTIALS="$2"
                 shift 2
                 ;;
             -b|--base-url)
@@ -204,6 +205,10 @@ parse_arguments() {
                 ;;
             -p|--parallel)
                 PARALLEL_JOBS="$2"
+                shift 2
+                ;;
+            --parallel-threshold)
+                PARALLEL_THRESHOLD="$2"
                 shift 2
                 ;;
             -r|--retry)
@@ -264,17 +269,20 @@ validate_inputs() {
         ((errors++))
     fi
 
-    # Check authentication
-    if [[ -z "$BBS_PAT" ]] && [[ -z "$BBS_USER" ]]; then
-        # Check environment variables
-        if [[ -n "${BBS_PAT:-}" ]]; then
-            BBS_PAT="${BBS_PAT}"
-        elif [[ -n "${BBS_USER:-}" ]] && [[ -n "${BBS_PASSWORD:-}" ]]; then
-            BBS_USER="${BBS_USER}:${BBS_PASSWORD}"
+    # Check authentication (Basic auth only)
+    if [[ -z "$BBS_CREDENTIALS" ]]; then
+        if [[ -n "${BBS_USER:-}" ]] && [[ -n "${BBS_PASSWORD:-}" ]]; then
+            BBS_CREDENTIALS="${BBS_USER}:${BBS_PASSWORD}"
         else
-            log_error "Authentication required. Use -t/--token or -u/--user, or set BBS_PAT/BBS_USER/BBS_PASSWORD environment variables"
+            log_error "Authentication required. Use -u/--user <user:pass> or set BBS_USER and BBS_PASSWORD environment variables"
             ((errors++))
         fi
+    fi
+
+    # Validate credentials format (must contain a colon separating user and password)
+    if [[ -n "$BBS_CREDENTIALS" ]] && [[ "$BBS_CREDENTIALS" != *:* ]]; then
+        log_error "Credentials must be in 'username:password' format"
+        ((errors++))
     fi
 
     # Validate numeric parameters
@@ -285,6 +293,11 @@ validate_inputs() {
 
     if ! [[ "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || [[ "$PARALLEL_JOBS" -lt 1 ]] || [[ "$PARALLEL_JOBS" -gt 20 ]]; then
         log_error "Parallel jobs must be between 1 and 20"
+        ((errors++))
+    fi
+
+    if ! [[ "$PARALLEL_THRESHOLD" =~ ^[0-9]+$ ]]; then
+        log_error "Parallel threshold must be a non-negative integer"
         ((errors++))
     fi
 
@@ -352,12 +365,9 @@ parse_projects_csv() {
 # API Functions
 #-------------------------------------------------------------------------------
 get_auth_header() {
-    if [[ -n "$BBS_PAT" ]]; then
-        echo "Authorization: Bearer $BBS_PAT"
-    elif [[ -n "$BBS_USER" ]]; then
-        local encoded=$(echo -n "$BBS_USER" | base64)
-        echo "Authorization: Basic $encoded"
-    fi
+    # Kept for backward compatibility; credentials are now passed to curl via -u.
+    # Returns empty so callers passing this as a header are effectively no-ops.
+    echo ""
 }
 
 extract_base_url() {
@@ -376,11 +386,11 @@ api_call_with_retry() {
     while [[ $attempt -le $RETRY_COUNT ]]; do
         log_debug "API call attempt $attempt/$RETRY_COUNT: $url"
         
-        # Make API call with timeout
+        # Make API call with timeout (Basic auth via -u, matching customer's working pattern)
         local tmp_file=$(mktemp)
         http_code=$(curl -s -w "%{http_code}" \
-            -H "$(get_auth_header)" \
-            -H "Content-Type: application/json" \
+            -u "$BBS_CREDENTIALS" \
+            -H "Accept: application/json" \
             --connect-timeout "$API_TIMEOUT" \
             --max-time $((API_TIMEOUT * 2)) \
             -o "$tmp_file" \
@@ -598,64 +608,110 @@ write_error_entry() {
 #-------------------------------------------------------------------------------
 # Main Processing Functions
 #-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+# Single-repo worker: fetches size, writes report row and (if needed) error row.
+# Designed to be safe to call from a background subshell — only appends to
+# files (atomic for small lines under POSIX O_APPEND) and never mutates shared
+# in-memory state.
+#-------------------------------------------------------------------------------
+process_single_repo() {
+    local project_key="$1"
+    local project_name="$2"
+    local repo_json="$3"
+    local base_url="$4"
+
+    local repo_slug
+    repo_slug=$(echo "$repo_json" | jq -r '.slug')
+
+    log_debug "Processing repo: $project_key/$repo_slug"
+
+    local size
+    size=$(fetch_repo_size "$project_key" "$repo_slug" "$base_url")
+
+    if [[ $(echo "$size" | jq -r '.repository') == "-1" ]]; then
+        write_error_entry "$project_key" "$repo_slug" "FETCH_SIZE" "Failed to fetch repository size"
+    fi
+
+    write_repo_entry "$project_key" "$project_name" "$repo_json" "$size"
+}
+
 process_project() {
     local project_key="$1"
     local project_name="$2"
     local project_url="$3"
-    
+
     # Check if already processed (for resume)
     if is_project_processed "$project_key"; then
         log_info "Skipping already processed project: $project_key"
         return 0
     fi
-    
+
     # Determine base URL
     local base_url="${BBS_BASE_URL:-$(extract_base_url "$project_url")}"
-    
+
     log_info "Processing project: $project_key ($project_name)"
-    
+
     # Fetch all repos for the project
-    local repos=$(fetch_repos_for_project "$project_key" "$base_url")
-    
+    local repos
+    repos=$(fetch_repos_for_project "$project_key" "$base_url")
+
     if [[ -z "$repos" ]] || [[ "$repos" == "[]" ]]; then
         log_warn "No repositories found or failed to fetch for project: $project_key"
         write_error_entry "$project_key" "" "FETCH_REPOS" "No repositories found or API call failed"
         update_progress "$project_key" "failed"
         return 1
     fi
-    
-    local repo_count=$(echo "$repos" | jq 'length')
+
+    local repo_count
+    repo_count=$(echo "$repos" | jq 'length')
     log_info "Found $repo_count repositories in project $project_key"
-    
-    # Process each repository
-    local processed=0
-    local failed=0
-    
-    echo "$repos" | jq -c '.[]' | while read -r repo; do
-        local repo_slug=$(echo "$repo" | jq -r '.slug')
-        
-        log_debug "Processing repo: $project_key/$repo_slug"
-        
-        # Fetch size for the repo
-        local size=$(fetch_repo_size "$project_key" "$repo_slug" "$base_url")
-        
-        if [[ $(echo "$size" | jq -r '.repository') == "-1" ]]; then
-            write_error_entry "$project_key" "$repo_slug" "FETCH_SIZE" "Failed to fetch repository size"
-            ((failed++))
-        fi
-        
-        # Write repo entry regardless of size fetch status
-        write_repo_entry "$project_key" "$project_name" "$repo" "$size"
-        ((processed++))
-        
-        # Small delay to avoid overwhelming the server
-        sleep 0.1
-    done
-    
+
+    # Decide mode based on threshold
+    if [[ "$repo_count" -gt "$PARALLEL_THRESHOLD" ]]; then
+        log_info "Parallel mode for $project_key: $repo_count repos > threshold $PARALLEL_THRESHOLD (concurrency=$PARALLEL_JOBS)"
+        _process_repos_parallel "$project_key" "$project_name" "$base_url" "$repos"
+    else
+        log_info "Sequential mode for $project_key: $repo_count repos <= threshold $PARALLEL_THRESHOLD"
+        _process_repos_sequential "$project_key" "$project_name" "$base_url" "$repos"
+    fi
+
     update_progress "$project_key" "success"
-    log_info "Completed project $project_key: processed $processed repos, failed $failed size fetches"
-    
+    log_info "Completed project $project_key"
+
     return 0
+}
+
+_process_repos_sequential() {
+    local project_key="$1"
+    local project_name="$2"
+    local base_url="$3"
+    local repos="$4"
+
+    # Process substitution avoids the subshell-counter trap of `cmd | while`.
+    while read -r repo; do
+        process_single_repo "$project_key" "$project_name" "$repo" "$base_url"
+        sleep 0.1   # gentle pacing in sequential mode
+    done < <(echo "$repos" | jq -c '.[]')
+}
+
+_process_repos_parallel() {
+    local project_key="$1"
+    local project_name="$2"
+    local base_url="$3"
+    local repos="$4"
+
+    while read -r repo; do
+        # Throttle: don't exceed PARALLEL_JOBS background workers at once.
+        while [[ $(jobs -rp | wc -l) -ge "$PARALLEL_JOBS" ]]; do
+            sleep 0.05
+        done
+
+        process_single_repo "$project_key" "$project_name" "$repo" "$base_url" &
+    done < <(echo "$repos" | jq -c '.[]')
+
+    # Wait for all background workers spawned in this function to finish
+    # before the project is marked complete.
+    wait
 }
 
 process_batch() {
