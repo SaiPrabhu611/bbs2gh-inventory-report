@@ -496,6 +496,90 @@ fetch_repo_size() {
 }
 
 #-------------------------------------------------------------------------------
+# Fetch the most recent commit date on the default branch.
+# Returns a string like "2026-01-13 10:02 AM", or empty if unavailable
+# (e.g. empty repo, missing default branch, API failure).
+#-------------------------------------------------------------------------------
+fetch_last_commit_date() {
+    local project_key="$1"
+    local repo_slug="$2"
+    local base_url="$3"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo ""
+        return 0
+    fi
+
+    local api_url="${base_url}/rest/api/${BBS_API_VERSION}/projects/${project_key}/repos/${repo_slug}/commits?limit=1"
+    local response
+    response=$(api_call_with_retry "$api_url" "last commit for $project_key/$repo_slug")
+
+    if [[ -z "$response" ]]; then
+        echo ""
+        return 0
+    fi
+
+    local ts_ms
+    ts_ms=$(echo "$response" | jq -r '.values[0].authorTimestamp // empty')
+    if [[ -z "$ts_ms" ]] || ! [[ "$ts_ms" =~ ^[0-9]+$ ]]; then
+        echo ""
+        return 0
+    fi
+
+    local ts_sec=$((ts_ms / 1000))
+    # Try GNU date first, then BSD date as fallback
+    date -d "@${ts_sec}" '+%Y-%m-%d %I:%M %p' 2>/dev/null \
+        || date -r "${ts_sec}" '+%Y-%m-%d %I:%M %p' 2>/dev/null \
+        || echo ""
+}
+
+#-------------------------------------------------------------------------------
+# Fetch total pull-request count (all states) for a repo.
+# Returns an integer (0 on error or none).
+#-------------------------------------------------------------------------------
+fetch_pr_count() {
+    local project_key="$1"
+    local repo_slug="$2"
+    local base_url="$3"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    local total=0
+    local start=0
+    local page_size=1000   # large page to minimize round-trips
+    local is_last_page="false"
+
+    while [[ "$is_last_page" == "false" ]]; do
+        local api_url="${base_url}/rest/api/${BBS_API_VERSION}/projects/${project_key}/repos/${repo_slug}/pull-requests?state=ALL&start=${start}&limit=${page_size}"
+        local response
+        response=$(api_call_with_retry "$api_url" "PR count for $project_key/$repo_slug")
+
+        if [[ -z "$response" ]]; then
+            echo "$total"
+            return 0
+        fi
+
+        local size
+        size=$(echo "$response" | jq -r '.size // 0')
+        total=$((total + size))
+
+        is_last_page=$(echo "$response" | jq -r '.isLastPage // true')
+        local next
+        next=$(echo "$response" | jq -r '.nextPageStart // "null"')
+
+        if [[ "$is_last_page" == "true" ]] || [[ "$next" == "null" ]]; then
+            break
+        fi
+        start="$next"
+    done
+
+    echo "$total"
+}
+
+#-------------------------------------------------------------------------------
 # Progress Tracking
 #-------------------------------------------------------------------------------
 PROGRESS_FILE=""
@@ -552,8 +636,8 @@ init_reports() {
     REPORT_FILE="${REPORT_DIR}/repo_inventory_${TIMESTAMP}.csv"
     ERRORS_FILE="${REPORT_DIR}/errors_${TIMESTAMP}.csv"
     
-    # Write headers
-    echo "project_key,project_name,repo_slug,repo_name,repo_id,clone_url_ssh,clone_url_http,repo_state,repo_size_bytes,attachments_size_bytes,total_size_bytes,total_size_mb,fetch_timestamp" > "$REPORT_FILE"
+    # Write headers (customer-requested schema)
+    echo "project-key,project-name,repo,url,last-commit-date,repo-size-in-bytes,attachments-size-in-bytes,is-archived,pr-count" > "$REPORT_FILE"
     echo "project_key,repo_slug,error_type,error_message,timestamp" > "$ERRORS_FILE"
     
     log_info "Report file initialized: $REPORT_FILE"
@@ -564,33 +648,40 @@ write_repo_entry() {
     local project_name="$2"
     local repo_json="$3"
     local size_json="$4"
-    
+    local last_commit_date="$5"
+    local pr_count="$6"
+    local base_url="$7"
+
     # Extract repo details
-    local repo_slug=$(echo "$repo_json" | jq -r '.slug // "unknown"')
-    local repo_name=$(echo "$repo_json" | jq -r '.name // "unknown"')
-    local repo_id=$(echo "$repo_json" | jq -r '.id // 0')
-    local repo_state=$(echo "$repo_json" | jq -r '.state // "AVAILABLE"')
-    
-    # Extract clone URLs
-    local clone_ssh=$(echo "$repo_json" | jq -r '.links.clone[]? | select(.name == "ssh") | .href // ""')
-    local clone_http=$(echo "$repo_json" | jq -r '.links.clone[]? | select(.name == "http") | .href // ""')
-    
-    # Extract sizes
-    local repo_size=$(echo "$size_json" | jq -r '.repository // 0')
-    local attachments_size=$(echo "$size_json" | jq -r '.attachments // 0')
-    
-    # Calculate totals
-    local total_size=$((repo_size + attachments_size))
-    local total_size_mb=$(echo "scale=2; $total_size / 1048576" | bc 2>/dev/null || echo "0")
-    
-    local timestamp=$(date -Iseconds)
-    
-    # Escape special characters in names
+    local repo_slug
+    repo_slug=$(echo "$repo_json" | jq -r '.slug // "unknown"')
+
+    # is-archived: BBS exposes .archived as bool (BBS 8+); default to false otherwise.
+    local archived_raw
+    archived_raw=$(echo "$repo_json" | jq -r '.archived // false')
+    local archived="False"
+    [[ "$archived_raw" == "true" ]] && archived="True"
+
+    # Sizes (use 0 if /sizes failed)
+    local repo_size
+    repo_size=$(echo "$size_json" | jq -r '.repository // 0')
+    [[ "$repo_size" == "-1" ]] && repo_size=0
+    local attachments_size
+    attachments_size=$(echo "$size_json" | jq -r '.attachments // 0')
+    [[ "$attachments_size" == "-1" ]] && attachments_size=0
+
+    # Browse URL (matches customer-requested format: <base>/projects/<KEY>/repos/<SLUG>)
+    local repo_url="${base_url}/projects/${project_key}/repos/${repo_slug}"
+
+    # PR count fallback
+    [[ -z "$pr_count" ]] && pr_count=0
+
+    # Escape commas/quotes in free-text fields
     project_name=$(echo "$project_name" | sed 's/,/;/g' | sed 's/"/""/g')
-    repo_name=$(echo "$repo_name" | sed 's/,/;/g' | sed 's/"/""/g')
-    
-    # Write to report
-    echo "\"$project_key\",\"$project_name\",\"$repo_slug\",\"$repo_name\",$repo_id,\"$clone_ssh\",\"$clone_http\",\"$repo_state\",$repo_size,$attachments_size,$total_size,$total_size_mb,\"$timestamp\"" >> "$REPORT_FILE"
+
+    # Order: project-key, project-name, repo, url, last-commit-date,
+    #        repo-size-in-bytes, attachments-size-in-bytes, is-archived, pr-count
+    echo "\"$project_key\",\"$project_name\",\"$repo_slug\",\"$repo_url\",\"$last_commit_date\",\"$repo_size\",\"$attachments_size\",\"$archived\",$pr_count" >> "$REPORT_FILE"
 }
 
 write_error_entry() {
@@ -625,14 +716,23 @@ process_single_repo() {
 
     log_debug "Processing repo: $project_key/$repo_slug"
 
+    # 1. Repo size + attachments
     local size
     size=$(fetch_repo_size "$project_key" "$repo_slug" "$base_url")
-
     if [[ $(echo "$size" | jq -r '.repository') == "-1" ]]; then
         write_error_entry "$project_key" "$repo_slug" "FETCH_SIZE" "Failed to fetch repository size"
     fi
 
-    write_repo_entry "$project_key" "$project_name" "$repo_json" "$size"
+    # 2. Last commit date on default branch (empty if repo has no commits)
+    local last_commit_date
+    last_commit_date=$(fetch_last_commit_date "$project_key" "$repo_slug" "$base_url")
+
+    # 3. Total PR count (all states)
+    local pr_count
+    pr_count=$(fetch_pr_count "$project_key" "$repo_slug" "$base_url")
+
+    write_repo_entry "$project_key" "$project_name" "$repo_json" "$size" \
+        "$last_commit_date" "$pr_count" "$base_url"
 }
 
 process_project() {
@@ -762,7 +862,13 @@ process_batch() {
 #-------------------------------------------------------------------------------
 generate_summary() {
     local total_repos=$(tail -n +2 "$REPORT_FILE" | wc -l)
-    local total_size=$(tail -n +2 "$REPORT_FILE" | awk -F',' '{sum += $11} END {print sum}')
+    # New schema: $6=repo-size-in-bytes, $7=attachments-size-in-bytes (both quoted).
+    # Strip quotes via gsub before summing.
+    local total_size
+    total_size=$(tail -n +2 "$REPORT_FILE" | awk -F',' '{
+        gsub(/"/, "", $6); gsub(/"/, "", $7);
+        sum += $6 + $7
+    } END { print sum+0 }')
     local total_errors=$(tail -n +2 "$ERRORS_FILE" | wc -l)
     
     # Convert to human-readable size
