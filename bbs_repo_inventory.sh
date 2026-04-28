@@ -379,6 +379,10 @@ extract_base_url() {
 api_call_with_retry() {
     local url="$1"
     local context="$2"
+    # Optional 3rd arg: "silent" → downgrade 4xx errors to debug (no terminal noise).
+    # Use this for endpoints where a non-200 is expected/benign (e.g. empty
+    # repo has no commits → /commits returns 404 or similar).
+    local silent="${3:-false}"
     local attempt=1
     local response=""
     local http_code=""
@@ -412,7 +416,11 @@ api_call_with_retry() {
             sleep "$RETRY_DELAY"
         else
             # Client error or other - log and fail
-            log_error "API call failed for $context: HTTP $http_code - $url"
+            if [[ "$silent" == "true" ]]; then
+                log_debug "API call returned HTTP $http_code for $context (silent): $url"
+            else
+                log_error "API call failed for $context: HTTP $http_code - $url"
+            fi
             echo ""
             return 1
         fi
@@ -420,7 +428,11 @@ api_call_with_retry() {
         ((attempt++))
     done
     
-    log_error "API call failed after $RETRY_COUNT attempts for $context: $url"
+    if [[ "$silent" == "true" ]]; then
+        log_debug "API call exhausted retries for $context (silent): $url"
+    else
+        log_error "API call failed after $RETRY_COUNT attempts for $context: $url"
+    fi
     echo ""
     return 1
 }
@@ -516,7 +528,9 @@ fetch_last_commit_date() {
 
     local api_url="${base_url}/rest/api/${BBS_API_VERSION}/projects/${project_key}/repos/${repo_slug}/commits?limit=1"
     local response
-    response=$(api_call_with_retry "$api_url" "last commit for $project_key/$repo_slug")
+    # Silent mode: an empty repo / missing default branch returns a 4xx;
+    # that's expected and should NOT be logged as an error to the terminal.
+    response=$(api_call_with_retry "$api_url" "last commit for $project_key/$repo_slug" "true")
 
     if [[ -z "$response" ]]; then
         echo ""
@@ -730,12 +744,16 @@ process_single_repo() {
     fi
 
     # 2. Last commit date on default branch (empty if repo has no commits)
-    local last_commit_date
-    last_commit_date=$(fetch_last_commit_date "$project_key" "$repo_slug" "$base_url")
+    # DISABLED: extra API call not needed for current inventory run.
+    # Re-enable by uncommenting the two lines below.
+    local last_commit_date=""
+    # last_commit_date=$(fetch_last_commit_date "$project_key" "$repo_slug" "$base_url")
 
     # 3. Total PR count (all states)
-    local pr_count
-    pr_count=$(fetch_pr_count "$project_key" "$repo_slug" "$base_url")
+    # DISABLED: extra API calls not needed for current inventory run.
+    # Re-enable by uncommenting the line below.
+    local pr_count=0
+    # pr_count=$(fetch_pr_count "$project_key" "$repo_slug" "$base_url")
 
     write_repo_entry "$project_key" "$project_name" "$repo_json" "$size" \
         "$last_commit_date" "$pr_count" "$base_url"
