@@ -450,9 +450,13 @@ fetch_repos_for_project() {
         fi
         
         # Parse response
+        # NOTE: Do NOT use `// true` for boolean fields! In jq, the `//`
+        # operator treats BOTH null AND false as "missing", so
+        # `.isLastPage // true` returns "true" when the API explicitly
+        # says false, breaking pagination after the first page.
         local repos=$(echo "$response" | jq -c '.values // []')
         local next_page_start=$(echo "$response" | jq -r '.nextPageStart // "null"')
-        is_last_page=$(echo "$response" | jq -r '.isLastPage // true')
+        is_last_page=$(echo "$response" | jq -r 'if .isLastPage == false then "false" else "true" end')
         
         # Merge repos
         all_repos=$(echo "$all_repos $repos" | jq -s 'add')
@@ -566,7 +570,9 @@ fetch_pr_count() {
         size=$(echo "$response" | jq -r '.size // 0')
         total=$((total + size))
 
-        is_last_page=$(echo "$response" | jq -r '.isLastPage // true')
+        # See note in fetch_repos_for_project: jq's `// true` is unsafe for
+        # boolean fields because `false // true` evaluates to true.
+        is_last_page=$(echo "$response" | jq -r 'if .isLastPage == false then "false" else "true" end')
         local next
         next=$(echo "$response" | jq -r '.nextPageStart // "null"')
 
@@ -963,3 +969,4 @@ main() {
 
 # Run main function
 main "$@"
+
