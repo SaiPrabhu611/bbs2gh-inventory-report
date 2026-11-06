@@ -743,18 +743,13 @@ process_single_repo() {
         write_error_entry "$project_key" "$repo_slug" "FETCH_SIZE" "Failed to fetch repository size"
     fi
 
-    # 2. Last commit date on default branch (empty if repo has no commits)
-    # DISABLED: extra API call not needed for current inventory run.
-    # Re-enable by uncommenting the two lines below.
-    local last_commit_date=""
-    # last_commit_date=$(fetch_last_commit_date "$project_key" "$repo_slug" "$base_url")
+    # 2. Last commit date on the default branch (empty if repo has no commits)
+    local last_commit_date
+    last_commit_date=$(fetch_last_commit_date "$project_key" "$repo_slug" "$base_url")
 
     # 3. Total PR count (all states)
-    # DISABLED: extra API calls not needed for current inventory run.
-    # Re-enable by uncommenting the line below.
-    local pr_count=0
-    # pr_count=$(fetch_pr_count "$project_key" "$repo_slug" "$base_url")
-
+    local pr_count
+    pr_count=$(fetch_pr_count "$project_key" "$repo_slug" "$base_url")
     write_repo_entry "$project_key" "$project_name" "$repo_json" "$size" \
         "$last_commit_date" "$pr_count" "$base_url"
 }
@@ -987,4 +982,3 @@ main() {
 
 # Run main function
 main "$@"
-
